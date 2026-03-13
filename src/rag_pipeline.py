@@ -24,11 +24,12 @@ from typing import Any
 
 import torch
 from dotenv import load_dotenv
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, pipeline
+from threading import Thread
+
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, TextIteratorStreamer, pipeline
 
 from llama_index.core import (
     Settings,
-    SimpleDirectoryReader,
     StorageContext,
     VectorStoreIndex,
     load_index_from_storage,
@@ -38,8 +39,12 @@ from llama_index.core.llms import CustomLLM
 from llama_index.core.llms.callbacks import llm_completion_callback
 from llama_index.core.node_parser import SentenceSplitter
 from llama_index.core.prompts import PromptTemplate
+from llama_index.core.query_engine import RetrieverQueryEngine
+from llama_index.core.retrievers import QueryFusionRetriever
+from llama_index.core.schema import Document, TextNode
 from llama_index.core.tools import QueryEngineTool, ToolMetadata
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
+from llama_index.retrievers.bm25 import BM25Retriever
 
 load_dotenv()
 
@@ -51,20 +56,136 @@ DOCS_DIR = Path("data/rag")
 PERSIST_DIR = Path("data/rag_index")
 
 # ---------------------------------------------------------------------------
-# Legal metadata extraction
+# Article-boundary chunker
 # ---------------------------------------------------------------------------
 
+# Maps filename → display name used in chunk headers and metadata.
+_DOC_NAMES: dict[str, str] = {
+    "gdpr.txt": "GDPR",
+    "ai_act.txt": "AI Act",
+    "data_act.txt": "Data Act",
+    "data_governance_act.txt": "Data Governance Act",
+    "cyber_resilience_act.txt": "Cyber Resilience Act",
+}
 
-def _extract_legal_metadata(text: str) -> dict:
-    """Extract article numbers, recital numbers and chapter references from a text chunk."""
-    articles = sorted(set(re.findall(r'[Aa]rticle\s+(\d+)', text)), key=int)
-    recitals = sorted(set(re.findall(r'\((\d+)\)\s+[A-Z]', text)), key=int)
-    chapters = list(dict.fromkeys(re.findall(r'CHAPTER\s+[IVX\d]+', text)))
-    return {
-        "chunk_articles": ", ".join(articles) if articles else "",
-        "chunk_recitals": ", ".join(recitals) if recitals else "",
-        "chunk_chapters": ", ".join(chapters) if chapters else "",
-    }
+# Matches "Article 5" / "Article\xa05" (non-breaking space used by EUR-Lex PDFs)
+# anchored to start-of-line with optional trailing whitespace.
+_ARTICLE_LINE_RE = re.compile(r"^Article[\s\xa0]+(\d+)[\s\xa0]*$")
+
+# Top-level numbered paragraph inside an article body, e.g. "1.   " or "1.\xa0\xa0"
+_PARA_RE = re.compile(r"^\d+\.[\s\xa0]")
+
+
+def _build_article_nodes(docs_dir: Path, sub_chunk_tokens: int = 512) -> list[TextNode]:
+    """Parse every .txt file in *docs_dir* on Article-N boundaries.
+
+    Each article becomes one TextNode prefixed with a ``[Doc | Article N — Title]``
+    header.  Articles whose text exceeds *sub_chunk_tokens* (rough 4-chars-per-token
+    estimate) are further split on their top-level numbered-paragraph boundaries
+    (``1.``, ``2.``, …), with the same header prepended to every sub-chunk.
+
+    Content before the first article (preamble / recitals) is split with
+    SentenceSplitter and tagged ``[Doc | Preamble]``.
+    """
+    max_chars = sub_chunk_tokens * 4  # rough chars-per-token budget
+    splitter = SentenceSplitter(chunk_size=sub_chunk_tokens, chunk_overlap=64)
+    nodes: list[TextNode] = []
+
+    for txt_file in sorted(docs_dir.glob("*.txt")):
+        doc_name = _DOC_NAMES.get(txt_file.name, txt_file.stem)
+        raw_lines = txt_file.read_text(encoding="utf-8").splitlines()
+
+        # ── locate every "Article N" header line ────────────────────────────
+        article_starts: list[tuple[int, str]] = []
+        for i, line in enumerate(raw_lines):
+            m = _ARTICLE_LINE_RE.match(line)
+            if m:
+                article_starts.append((i, m.group(1)))
+
+        # ── preamble (recitals, whereas clauses, …) ─────────────────────────
+        preamble_end = article_starts[0][0] if article_starts else len(raw_lines)
+        preamble_text = "\n".join(raw_lines[:preamble_end]).strip()
+        if preamble_text:
+            header = f"[{doc_name} | Preamble]\n\n"
+            for sub in splitter.get_nodes_from_documents([Document(text=preamble_text)]):
+                nodes.append(TextNode(
+                    text=header + sub.text,
+                    metadata={"document": doc_name, "article": "preamble",
+                               "chunk_articles": "", "chunk_type": "preamble"},
+                ))
+
+        # ── one chunk (or more) per article ─────────────────────────────────
+        article_starts.append((len(raw_lines), None))  # sentinel
+
+        for idx, (start_i, art_no) in enumerate(article_starts[:-1]):
+            end_i = article_starts[idx + 1][0]
+            article_lines = raw_lines[start_i:end_i]
+
+            # Title is normally two lines after the "Article N" line
+            raw_title = article_lines[2].strip().rstrip("`") if len(article_lines) > 2 else ""
+            # Discard if it looks like body text (starts with digit or open-paren)
+            if raw_title and re.match(r"^[\d(]", raw_title):
+                raw_title = ""
+
+            header = f"[{doc_name} | Article {art_no}]"
+            if raw_title:
+                header += f" — {raw_title}"
+            header += "\n\n"
+
+            # Prepend a plain-language identity sentence so the embedding model
+            # captures the document name as body content, not just as a bracket tag.
+            identity = f"The following is Article {art_no} of the {doc_name}"
+            if raw_title:
+                identity += f", titled '{raw_title}'"
+            identity += ".\n\n"
+
+            article_body = identity + "\n".join(article_lines).strip()
+            full_text = header + article_body
+            base_meta = {
+                "document": doc_name,
+                "article": art_no,
+                "chunk_articles": art_no,
+                "chunk_type": "article",
+            }
+
+            if len(full_text) <= max_chars:
+                nodes.append(TextNode(text=full_text, metadata=base_meta))
+            else:
+                # ── sub-split on top-level paragraph boundaries ──────────────
+                # Collect indices of lines that start a new top-level paragraph
+                para_breaks = [
+                    i for i, line in enumerate(article_lines)
+                    if _PARA_RE.match(line)
+                ]
+
+                if len(para_breaks) >= 2:
+                    # Build one chunk per paragraph (or per pair when they're tiny)
+                    para_breaks.append(len(article_lines))  # sentinel
+                    for p_idx in range(len(para_breaks) - 1):
+                        seg = article_lines[para_breaks[p_idx]: para_breaks[p_idx + 1]]
+                        seg_text = header + identity + "\n".join(seg).strip()
+                        meta = {**base_meta, "chunk_part": p_idx + 1}
+                        if len(seg_text) <= max_chars:
+                            nodes.append(TextNode(text=seg_text, metadata=meta))
+                        else:
+                            # Paragraph still too long → SentenceSplitter fallback
+                            for j, sub in enumerate(splitter.get_nodes_from_documents(
+                                    [Document(text="\n".join(seg))])):
+                                nodes.append(TextNode(
+                                    text=header + identity + sub.text,
+                                    metadata={**meta, "chunk_subpart": j + 1},
+                                ))
+                else:
+                    # No paragraph markers (e.g. pure definition list) → SentenceSplitter
+                    # article_body already contains the identity sentence.
+                    for j, sub in enumerate(splitter.get_nodes_from_documents(
+                            [Document(text=article_body)])):
+                        nodes.append(TextNode(
+                            text=header + sub.text,
+                            metadata={**base_meta, "chunk_part": j + 1},
+                        ))
+
+    return nodes
 
 
 # ---------------------------------------------------------------------------
@@ -104,12 +225,13 @@ class QwenLLM(CustomLLM):
                 self.model_id,
                 quantization_config=quantization_config,
                 device_map="auto",
-                dtype=torch.float16,  # replaces deprecated torch_dtype
+                dtype=torch.float16, 
                 token=hf_token,
                 max_memory={0: "8GiB", "cpu": "20GiB"},
             )
-            # Pass generation params at call time, not in the constructor,
-            # to avoid conflicts with the model's stored generation_config.
+            # Clear max_length from the stored generation_config so it doesn't
+            # conflict with max_new_tokens passed at call time.
+            model.generation_config.max_length = None
             self._pipe = pipeline(
                 "text-generation",
                 model=model,
@@ -145,8 +267,31 @@ class QwenLLM(CustomLLM):
 
     @llm_completion_callback()
     def stream_complete(self, prompt: str, **_kwargs: Any):
-        response = self.complete(prompt)
-        yield CompletionResponse(text=response.text, delta=response.text)
+        pipe = self._get_pipeline()
+        formatted = pipe.tokenizer.apply_chat_template(
+            [{"role": "user", "content": prompt}],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        inputs = pipe.tokenizer(formatted, return_tensors="pt").to(pipe.model.device)
+        streamer = TextIteratorStreamer(
+            pipe.tokenizer, skip_prompt=True, skip_special_tokens=True
+        )
+        thread = Thread(
+            target=pipe.model.generate,
+            kwargs={
+                **inputs,
+                "max_new_tokens": self.max_new_tokens,
+                "do_sample": False,
+                "streamer": streamer,
+            },
+        )
+        thread.start()
+
+        text = ""
+        for token in streamer:
+            text += token
+            yield CompletionResponse(text=text, delta=token)
 
 
 # ---------------------------------------------------------------------------
@@ -154,34 +299,32 @@ class QwenLLM(CustomLLM):
 # ---------------------------------------------------------------------------
 
 
-def build_index(force_rebuild: bool = False) -> VectorStoreIndex:
+def build_index(force_rebuild: bool = False) -> tuple[VectorStoreIndex, list[TextNode]]:
     """Load index from disk or build it from scratch.
+
+    Returns both the VectorStoreIndex and the list of TextNodes so that
+    BM25Retriever can be constructed from the same node objects.
 
     Args:
         force_rebuild: If True, re-index even if a persisted index exists.
     """
     Settings.embed_model = HuggingFaceEmbedding(model_name="BAAI/bge-small-en-v1.5")
     Settings.llm = QwenLLM()
-    # NOTE: If you change chunk_size or chunk_overlap, delete data/rag_index/ to force a rebuild.
-    Settings.chunk_size = 1024
-    Settings.chunk_overlap = 128
+
+    nodes = _build_article_nodes(DOCS_DIR)
 
     if not force_rebuild and PERSIST_DIR.exists():
         print(f"Loading index from {PERSIST_DIR} …")
         storage_context = StorageContext.from_defaults(persist_dir=str(PERSIST_DIR))
-        return load_index_from_storage(storage_context)
+        return load_index_from_storage(storage_context), nodes
 
-    print(f"Building index from {DOCS_DIR} …")
-    documents = SimpleDirectoryReader(str(DOCS_DIR)).load_data()
-    splitter = SentenceSplitter(chunk_size=Settings.chunk_size, chunk_overlap=Settings.chunk_overlap)
-    nodes = splitter.get_nodes_from_documents(documents)
-    for node in nodes:
-        node.metadata.update(_extract_legal_metadata(node.text))
+    print(f"Building index from {DOCS_DIR} (article-boundary chunking) …")
+    print(f"  → {len(nodes)} chunks created")
     index = VectorStoreIndex(nodes, show_progress=True)
     PERSIST_DIR.mkdir(parents=True, exist_ok=True)
     index.storage_context.persist(persist_dir=str(PERSIST_DIR))
     print(f"Index persisted to {PERSIST_DIR}")
-    return index
+    return index, nodes
 
 
 # ---------------------------------------------------------------------------
@@ -247,19 +390,40 @@ def verify_citations(response_text: str, source_nodes: list) -> dict:
 
 
 def create_legal_rag_tool(
-    similarity_top_k: int = 5,
+    similarity_top_k: int = 10,
     force_rebuild: bool = False,
 ) -> QueryEngineTool:
-    """Return a QueryEngineTool ready to be used inside a LlamaIndex agent.
+    """Return a QueryEngineTool backed by hybrid BM25 + dense retrieval.
+
+    BM25 handles exact-term matching (e.g. regulation names like
+    'Data Governance Act') while the dense retriever handles semantic
+    similarity.  QueryFusionRetriever merges both ranked lists via
+    Reciprocal Rank Fusion before passing context to the LLM.
 
     Args:
-        similarity_top_k: Number of document chunks to retrieve per query.
+        similarity_top_k: Chunks retrieved by each individual retriever.
+            The fused list contains up to 2 × similarity_top_k candidates
+            before deduplication.
         force_rebuild: Rebuild the vector index even if a cached one exists.
     """
     global _retriever
-    index = build_index(force_rebuild=force_rebuild)
-    _retriever = index.as_retriever(similarity_top_k=similarity_top_k)
-    query_engine = index.as_query_engine(similarity_top_k=similarity_top_k)
+    index, nodes = build_index(force_rebuild=force_rebuild)
+
+    dense_retriever = index.as_retriever(similarity_top_k=similarity_top_k)
+    bm25_retriever = BM25Retriever.from_defaults(
+        nodes=nodes,
+        similarity_top_k=similarity_top_k,
+    )
+    hybrid_retriever = QueryFusionRetriever(
+        retrievers=[dense_retriever, bm25_retriever],
+        similarity_top_k=similarity_top_k,
+        num_queries=1,          # no query rewriting — use the original query only
+        mode="reciprocal_rerank",
+        use_async=False,
+    )
+
+    _retriever = hybrid_retriever
+    query_engine = RetrieverQueryEngine.from_args(hybrid_retriever)
     query_engine.update_prompts({"response_synthesizer:text_qa_template": LEGAL_QA_PROMPT})
 
     return QueryEngineTool(

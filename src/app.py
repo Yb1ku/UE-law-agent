@@ -9,7 +9,7 @@ import asyncio
 
 import chainlit as cl
 from llama_index.core import Settings
-from llama_index.core.agent.workflow import ReActAgent
+from llama_index.core.agent.workflow import AgentStream, ReActAgent
 from llama_index.core.workflow import Context
 
 from rag_pipeline import create_legal_rag_tool, get_retriever, verify_citations
@@ -48,8 +48,33 @@ async def on_message(message: cl.Message):
     agent: ReActAgent = cl.user_session.get("agent")
     ctx: Context = cl.user_session.get("ctx")
 
+    # Create the message upfront so we can stream into it.
+    msg = cl.Message(content="")
+    await msg.send()
+
+    # Stream the agent's final answer token by token.
+    # The ReAct agent emits AgentStream events for every LLM token it generates,
+    # including intermediate reasoning steps (Thought/Action). We buffer output
+    # and only start forwarding once the final "Answer:" line begins.
+    buffer = ""
+    in_answer = False
+    ANSWER_PREFIX = "Answer:"
+
     async with cl.Step(name="Consulting EU legal documents", type="tool") as step:
-        response = await agent.run(message.content, ctx=ctx)
+        handler = agent.run(message.content, ctx=ctx)
+        async for event in handler.stream_events():
+            if isinstance(event, AgentStream) and event.delta:
+                if not in_answer:
+                    buffer += event.delta
+                    if ANSWER_PREFIX in buffer:
+                        in_answer = True
+                        idx = buffer.index(ANSWER_PREFIX) + len(ANSWER_PREFIX)
+                        answer_so_far = buffer[idx:].lstrip(" \n")
+                        if answer_so_far:
+                            await msg.stream_token(answer_so_far)
+                else:
+                    await msg.stream_token(event.delta)
+        response = await handler
         step.output = str(response)
 
     response_text = str(response)
@@ -105,4 +130,7 @@ async def on_message(message: cl.Message):
             "in the retrieved sources: " + "; ".join(phantoms) + "."
         )
 
-    await cl.Message(content=response_text + source_footer, elements=source_elements).send()
+    # Replace streamed content with the canonical response + footer/sources.
+    msg.content = response_text + source_footer
+    msg.elements = source_elements
+    await msg.update()
