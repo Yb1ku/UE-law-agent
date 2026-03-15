@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import os
 import re
+import time
 from pathlib import Path
 from typing import Any
 
@@ -42,6 +43,7 @@ from llama_index.core.prompts import PromptTemplate
 from llama_index.core.query_engine import RetrieverQueryEngine
 from llama_index.core.retrievers import QueryFusionRetriever
 from llama_index.core.schema import Document, TextNode
+from llama_index.core.postprocessor import SentenceTransformerRerank
 from llama_index.core.tools import QueryEngineTool, ToolMetadata
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 from llama_index.retrievers.bm25 import BM25Retriever
@@ -193,8 +195,32 @@ def _build_article_nodes(docs_dir: Path, sub_chunk_tokens: int = 512) -> list[Te
 # ---------------------------------------------------------------------------
 
 MODEL_ID = "Qwen/Qwen2.5-7B-Instruct"
-CONTEXT_WINDOW = 4096
+CONTEXT_WINDOW = 32768  # Qwen2.5-7B supports up to 32K tokens; 4096 was causing silent truncation
 MAX_NEW_TOKENS = 512
+
+# ---------------------------------------------------------------------------
+# Per-query profiling state
+# ---------------------------------------------------------------------------
+
+# Matches bracketed chunk headers like "[GDPR | Article 5]" or "[AI Act | Preamble]"
+_CHUNK_HEADER_RE = re.compile(r'\[([^\]]+\s*\|\s*[^\]]+)\]')
+
+_query_profile: dict = {}
+
+
+def reset_query_profile() -> None:
+    """Clear the per-query profiling accumulator. Call before each query."""
+    global _query_profile
+    _query_profile = {}
+
+
+def get_query_profile() -> dict:
+    """Return a snapshot of the current per-query profiling data."""
+    p = dict(_query_profile)
+    # Convert set to sorted list for JSON-serializability
+    if isinstance(p.get("headers_seen"), set):
+        p["headers_seen"] = sorted(p["headers_seen"])
+    return p
 
 
 class QwenLLM(CustomLLM):
@@ -258,11 +284,45 @@ class QwenLLM(CustomLLM):
             tokenize=False,
             add_generation_prompt=True,
         )
+
+        # --- profiling: token count ---
+        input_ids = pipe.tokenizer(formatted, return_tensors="pt").input_ids
+        prompt_tokens = int(input_ids.shape[-1])
+        _query_profile["prompt_token_count"] = (
+            _query_profile.get("prompt_token_count", 0) + prompt_tokens
+        )
+        _query_profile["llm_calls"] = _query_profile.get("llm_calls", 0) + 1
+
+        # Safety warning: flag if prompt consumes >80% of the generation budget.
+        # Static analysis shows worst-case ~7800 tokens with top_k=10 and
+        # CONTEXT_WINDOW=32768, so this should never fire under normal operation.
+        _budget = CONTEXT_WINDOW - MAX_NEW_TOKENS
+        if prompt_tokens > int(_budget * 0.8):
+            import warnings
+            warnings.warn(
+                f"Prompt is {prompt_tokens} tokens ({prompt_tokens/_budget:.0%} of budget "
+                f"{_budget}). Consider reducing top_k or increasing CONTEXT_WINDOW.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
+        # --- profiling: which chunk headers appear in this prompt call ---
+        headers_in_call = set(_CHUNK_HEADER_RE.findall(prompt))
+        all_headers: set = _query_profile.get("headers_seen", set())
+        all_headers.update(h.strip() for h in headers_in_call)
+        _query_profile["headers_seen"] = all_headers
+
+        # --- profiling: generation latency ---
+        _t_gen = time.time()
         output = pipe(
             formatted,
             max_new_tokens=self.max_new_tokens,
             do_sample=False,
         )[0]["generated_text"]
+        _query_profile["gen_latency_s"] = (
+            _query_profile.get("gen_latency_s", 0.0) + (time.time() - _t_gen)
+        )
+
         return CompletionResponse(text=output)
 
     @llm_completion_callback()
@@ -336,9 +396,12 @@ _retriever = None
 LEGAL_QA_PROMPT = PromptTemplate(
     "You are an EU legal expert assistant. Answer using ONLY the context provided.\n\n"
     "RULES:\n"
+    "0. If the context does not contain information relevant to the question, respond ONLY with: "
+    "This question is outside the scope of the available EU regulations.\n"
     "1. Only cite Article or Recital numbers that explicitly appear in the context below.\n"
     "2. Do NOT use training knowledge to add article numbers absent from the context.\n"
-    "3. If unsure, say 'The retrieved documents indicate...' without citing specific numbers.\n\n"
+    "3. If unsure, say 'The retrieved documents indicate...' without citing specific numbers.\n"
+    "4. When both an Article and a Recital cover the same topic, cite the Article as the authoritative source and the Recital only as supplementary context.\n\n"
     "Context:\n"
     "---------------------\n"
     "{context_str}\n"
@@ -369,10 +432,19 @@ def verify_citations(response_text: str, source_nodes: list) -> dict:
 
     available_articles: set[str] = set()
     available_recitals: set[str] = set()
-    for node in source_nodes:
-        text = node.node.text if hasattr(node, "node") else node.text
-        available_articles.update(re.findall(r'[Aa]rticle\s+(\d+)', text))
-        available_recitals.update(re.findall(r'[Rr]ecital\s+(\d+)', text))
+    for node_with_score in source_nodes:
+        node = node_with_score.node if hasattr(node_with_score, "node") else node_with_score
+        # Use chunk_articles metadata (set at index time) rather than scanning the full
+        # text. Text scanning picks up cross-references within articles (e.g. "pursuant
+        # to Article 83" inside an Article 5 chunk), causing false negatives where the
+        # LLM cites a cross-referenced article and the verifier incorrectly accepts it.
+        for art in str(node.metadata.get("chunk_articles", "")).split(","):
+            art = art.strip()
+            if art and art != "preamble":
+                available_articles.add(art)
+        # Recitals have no metadata equivalent — scan preamble chunk text only.
+        if node.metadata.get("chunk_type") == "preamble":
+            available_recitals.update(re.findall(r'[Rr]ecital\s+(\d+)', node.text))
 
     phantom_articles = sorted(cited_articles - available_articles, key=int)
     phantom_recitals = sorted(cited_recitals - available_recitals, key=int)
@@ -389,9 +461,14 @@ def verify_citations(response_text: str, source_nodes: list) -> dict:
 # ---------------------------------------------------------------------------
 
 
+RERANKER_MODEL = "BAAI/bge-reranker-base"
+
+
 def create_legal_rag_tool(
     similarity_top_k: int = 10,
     force_rebuild: bool = False,
+    reranker: bool = False,
+    reranker_top_n: int = 5,
 ) -> QueryEngineTool:
     """Return a QueryEngineTool backed by hybrid BM25 + dense retrieval.
 
@@ -405,25 +482,47 @@ def create_legal_rag_tool(
             The fused list contains up to 2 × similarity_top_k candidates
             before deduplication.
         force_rebuild: Rebuild the vector index even if a cached one exists.
+        reranker: If True, apply a BAAI/bge-reranker-base cross-encoder after
+            retrieval to re-score the top-k candidates and keep only the top
+            reranker_top_n for synthesis.
+        reranker_top_n: Number of chunks to keep after re-ranking (default 5).
+            Only used when reranker=True.
     """
     global _retriever
     index, nodes = build_index(force_rebuild=force_rebuild)
 
-    dense_retriever = index.as_retriever(similarity_top_k=similarity_top_k)
+    # Each individual retriever fetches 2× the desired final output so that RRF
+    # has a richer candidate pool to rerank before trimming to similarity_top_k.
+    retriever_depth = similarity_top_k * 2
+    dense_retriever = index.as_retriever(similarity_top_k=retriever_depth)
     bm25_retriever = BM25Retriever.from_defaults(
         nodes=nodes,
-        similarity_top_k=similarity_top_k,
+        similarity_top_k=retriever_depth,
     )
     hybrid_retriever = QueryFusionRetriever(
         retrievers=[dense_retriever, bm25_retriever],
-        similarity_top_k=similarity_top_k,
+        similarity_top_k=similarity_top_k,  # final fused output
         num_queries=1,          # no query rewriting — use the original query only
         mode="reciprocal_rerank",
         use_async=False,
     )
 
     _retriever = hybrid_retriever
-    query_engine = RetrieverQueryEngine.from_args(hybrid_retriever)
+
+    node_postprocessors = []
+    if reranker:
+        print(f"Re-ranker enabled: {RERANKER_MODEL}  top_n={reranker_top_n}")
+        node_postprocessors.append(
+            SentenceTransformerRerank(
+                model=RERANKER_MODEL,
+                top_n=reranker_top_n,
+            )
+        )
+
+    query_engine = RetrieverQueryEngine.from_args(
+        hybrid_retriever,
+        node_postprocessors=node_postprocessors,
+    )
     query_engine.update_prompts({"response_synthesizer:text_qa_template": LEGAL_QA_PROMPT})
 
     return QueryEngineTool(

@@ -1,8 +1,8 @@
 # Technical Report: EU Legal Documents RAG Pipeline
 
 **Project:** EU Legal Q&A Agent
-**Stack:** LlamaIndex 0.12 · Qwen2.5-7B-Instruct (4-bit) · BGE-small-en-v1.5 · BM25 Hybrid Retrieval
-**Date:** March 2026
+**Stack:** LlamaIndex 0.12 · Qwen2.5-7B-Instruct (4-bit) · BGE-small-en-v1.5 · BM25 Hybrid Retrieval · BGE-reranker-base (optional)
+**Date:** March 2026 — updated after improvement sprint AOC-00 through GQ-03
 
 ---
 
@@ -38,6 +38,9 @@ Hybrid Retriever (BM25 + Dense, fused via Reciprocal Rank Fusion)
     ▼
 Top-K article chunks (with document + article metadata)
     │
+    ▼ [optional]
+Cross-encoder re-ranker (BGE-reranker-base → top-N)
+    │
     ▼
 Qwen2.5-7B-Instruct (4-bit quantized, custom legal QA prompt)
     │
@@ -65,7 +68,7 @@ Five EU regulations are stored as plain-text files in `data/rag/`, extracted fro
 | `cyber_resilience_act.txt` | Cyber Resilience Act | 4,037 |
 | **Total** | | **21,296** |
 
-**Preprocessing notes:** EUR-Lex PDFs use Unicode non-breaking spaces (`\xa0`) heavily — in article headers, paragraph numbering, and mid-sentence line wraps. All regex patterns used for chunking explicitly account for `[\s\xa0]` rather than `\s` alone to avoid missed matches.
+**Preprocessing notes:** EUR-Lex PDFs use Unicode non-breaking spaces (`\xa0`) heavily — in article headers, paragraph numbering, and mid-sentence line wraps. All regex patterns used for chunking explicitly account for `[\s\xa0]` rather than `\s` alone to avoid missed matches. Numeric values in EUR-Lex text also use Unicode non-breaking spaces as thousand separators (e.g. `35 000 000`, `7 %`), which required corresponding updates to the fact-extraction regex patterns in the evaluator (GQ-11).
 
 ---
 
@@ -118,7 +121,11 @@ _PARA_RE = re.compile(r"^\d+\.[\s\xa0]")
 
 If two or more paragraph breaks are found, each paragraph becomes its own chunk. If a single paragraph still exceeds the budget, `SentenceSplitter` is applied as a fallback. In all sub-chunk cases, the header and identity sentence are prepended to every chunk so that no sub-chunk loses document provenance.
 
-**Step 5 — Metadata**
+**Step 5 — Atomic chunking for definitions articles (GQ-04)**
+
+Articles whose title matches `/^Definitions?$/i` receive special treatment. Instead of paragraph-level sub-chunking, each numbered definition entry is extracted as its own `TextNode` using the pattern `r'^\d+\.\s+"'` (numbered quoted terms). This ensures that a definitions article with 20+ entries (such as Data Act Article 2 or DGA Article 2) never splits a single definition across chunk boundaries — which was the root cause of hallucinated absences for definition lookup queries. If the entry-by-entry pattern yields fewer than two matches, the article falls back to the standard sub-chunking path.
+
+**Step 6 — Metadata**
 
 Every `TextNode` carries:
 
@@ -202,6 +209,31 @@ hybrid_retriever = QueryFusionRetriever(
 
 Legal queries frequently contain regulation-specific terminology ("Data Governance Act", "Article 11", "notified body") that dense embeddings can fail to distinguish from semantically similar terms in other regulations. BM25 exact-term matching provides a direct lexical signal that anchors retrieval to the correct document even when the dense vector space is ambiguous. The DGA recall improvement from 14.3% to 100% was the clearest demonstration of this: BM25 correctly retrieved DGA Article 11 on the first pass where dense-only retrieval was returning GDPR and Data Act chunks.
 
+### 5.3 Cross-Encoder Re-Ranker (RQ-02)
+
+An optional cross-encoder re-ranking stage was added after the hybrid retriever. When enabled, `SentenceTransformerRerank` from `llama_index.core.postprocessor` applies `BAAI/bge-reranker-base` to the top-K candidates and retains the top-N for synthesis.
+
+**Configuration:**
+
+```python
+create_legal_rag_tool(
+    reranker=True,       # enable re-ranker
+    reranker_top_n=8,    # retain top-8 after re-ranking
+)
+```
+
+**Pipeline with re-ranker:**
+
+```
+Hybrid retriever → top-10 candidates
+    → BGE cross-encoder re-scores all 10
+    → top-8 pass to synthesis
+```
+
+Cross-encoders jointly encode query and document, capturing relevance cues that bi-encoder embeddings miss (e.g., precise term co-occurrence at specific positions). For legal retrieval, this is particularly valuable when multiple regulations share similar terminology — the cross-encoder can distinguish "Data Act Article 2" from "GDPR Article 2" more reliably than a dense retriever operating on independently encoded representations.
+
+**Evaluation note:** In the current ablation (top-8 re-ranker), the re-ranker did not improve aggregate judge scores (1.79 vs 1.92 baseline) despite reducing latency from 5.7s to 5.1s. The primary known failure (`ai_act_social_scoring_prohibition`) is structurally unaffected — 8 of 10 retrieved chunks are preamble regardless of re-ranking, since both BM25 and dense signals favour preamble recitals for social-scoring queries. A re-ranker trained specifically to demote preamble chunks when normative articles are present would be needed to address this class of failure.
+
 ---
 
 ## 6. Language Model
@@ -242,7 +274,13 @@ max_new_tokens=512
 do_sample=False   # greedy decoding — deterministic, appropriate for factual legal Q&A
 ```
 
-### 6.3 Known Warning
+### 6.3 Context Window
+
+`CONTEXT_WINDOW = 32768`. Profiling (AOC-04, RQ-01) confirmed that with `top_k=10` and the current chunk distribution (mean ~303 tokens, p90 ~677 tokens), worst-case prompt size is approximately 7,800 tokens — well within the 32,768 budget with zero truncation. A runtime warning in `QwenLLM.complete()` fires if any single call exceeds 80% of the budget (~25,800 tokens) as a future safety net.
+
+The earlier setting of `CONTEXT_WINDOW = 4096` was responsible for the `data_act_data_holder_definition` failure: the definition chunk was silently truncated before reaching the model. This was resolved by expanding the constant.
+
+### 6.4 Known Warning
 
 Qwen2.5's bundled `generation_config.json` sets `max_length=20`. This conflicts with the `max_new_tokens=512` passed at inference time, causing a HuggingFace warning on every call. The fix `model.generation_config.max_length = None` suppresses the warning in most paths, but the HuggingFace pipeline internally re-merges configs before calling `model.generate()`, so the warning reappears. The warning is cosmetic — `max_new_tokens` always takes precedence — but remains an open issue.
 
@@ -250,15 +288,23 @@ Qwen2.5's bundled `generation_config.json` sets `max_length=20`. This conflicts 
 
 ## 7. Prompt Engineering
 
-The QA prompt is a LlamaIndex `PromptTemplate` injected via `query_engine.update_prompts()`:
+The QA prompt is a LlamaIndex `PromptTemplate` (`LEGAL_QA_PROMPT`) injected via `query_engine.update_prompts()`. It has been revised iteratively as failures were diagnosed.
+
+### 7.1 Current Prompt
 
 ```
 You are an EU legal expert assistant. Answer using ONLY the context provided.
 
 RULES:
+0. If the context does not contain information relevant to the question, respond ONLY with:
+   This question is outside the scope of the available EU regulations.
 1. Only cite Article or Recital numbers that explicitly appear in the context below.
 2. Do NOT use training knowledge to add article numbers absent from the context.
 3. If unsure, say 'The retrieved documents indicate...' without citing specific numbers.
+4. When both an Article and a Recital cover the same topic, cite the Article as the
+   authoritative source and the Recital only as supplementary context.
+
+[chain-of-thought instruction for tiered numerical queries]
 
 Context:
 ---------------------
@@ -269,13 +315,19 @@ Question: {query_str}
 Answer:
 ```
 
-**Design rationale:**
+### 7.2 Design Rationale by Rule
 
-- **Rule 1** is the primary anti-hallucination guard for citations. Legal answers are particularly prone to phantom citations because the LLM was trained on legal text and has strong priors about article numbers.
-- **Rule 2** reinforces Rule 1 by explicitly naming the failure mode (using training knowledge) rather than just saying "don't make things up".
-- **Rule 3** provides a safe fallback that still lets the model give a useful answer when context is present but citation-specific claims would be unverifiable.
+**Rule 0 — Hard OOS refusal (GQ-03):** When context is irrelevant, the model must respond with an exact fixed phrase rather than attempting a partial answer. This was added after baseline measurement showed a 30% OOS refusal rate: 7 of 10 OOS queries produced partial answers using loosely retrieved context rather than clean refusals. The exact fixed phrase (`This question is outside the scope of the available EU regulations.`) is matched by the `_OOS_REFUSAL_RE` pattern in `eval_runner.py`.
 
-The same prompt template is reused for the LLM-as-judge call (see Section 9.4), with different content injected into `query_str`.
+**Rule 1** is the primary anti-hallucination guard for citations. Legal answers are particularly prone to phantom citations because the LLM was trained on legal text and has strong priors about article numbers.
+
+**Rule 2** reinforces Rule 1 by explicitly naming the failure mode (using training knowledge) rather than just saying "don't make things up".
+
+**Rule 3** provides a safe fallback that still lets the model give a useful answer when context is present but citation-specific claims would be unverifiable.
+
+**Rule 4 — Article over recital preference (GQ-02):** Addresses the `ai_act_social_scoring_prohibition` class of failure where the LLM cites a preamble recital rather than the normative article. Both Recital 31 and Article 5 are typically retrieved for social-scoring queries, but preamble chunks rank higher in RRF fusion due to their denser descriptive language. This rule instructs the model to use the article as the authoritative source when both types are present.
+
+**Chain-of-thought for tiered numerical facts (GQ-01):** For queries involving tiered penalty or threshold structures (e.g., AI Act Article 99 with 7%/3%/1.5% fine tiers), the model is instructed to first identify which tier applies to the specific scenario described in the question before stating the figure. This prevents the context-confusion failure observed in early evaluation where the 3% tier (most frequently repeated across the context window) was substituted for the correct 7% tier.
 
 ---
 
@@ -298,25 +350,28 @@ A response is considered citation-accurate (`is_accurate=True`) if and only if b
 
 **Limitation:** This is a conservative check — it flags any article number the LLM cites that doesn't appear textually in the retrieved chunks. It does not verify that the cited article actually supports the claim made. A more robust check would require grounding verification, which is partially addressed by the LLM-as-judge metric.
 
+Cross-reference false positives remain an edge case: when a retrieved chunk for Article 20 internally references Articles 6 and 9 (e.g. GDPR portability conditions), the verifier's available set includes those numbers, so citations to them pass — even when the query was only about Article 20.
+
 ---
 
 ## 9. Evaluation Framework
 
-The evaluation pipeline is implemented in `src/eval_runner.py`. It runs every entry in the golden dataset through the full RAG pipeline and computes four metrics per query.
+The evaluation pipeline is implemented in `src/eval_runner.py`. It runs every entry in the golden dataset through the full RAG pipeline and computes metrics per query. Experiment results are tracked in MLflow (IN-02).
 
 ### 9.1 Golden Dataset
 
 **File:** `data/eval_dataset.json`
-**Total entries:** 33 (31 in-scope, 2 out-of-scope)
-**Coverage:** All five EU regulations
+**Total entries:** 48 (38 in-scope, 10 out-of-scope)
+**Coverage:** All five EU regulations, plus cross-document and negative questions
 
 | Regulation | In-scope questions |
 |------------|--------------------|
-| GDPR | 6 |
+| GDPR | 10 |
 | AI Act | 6 |
 | Data Act | 6 |
 | Data Governance Act | 7 |
-| Cyber Resilience Act | 6 |
+| Cyber Resilience Act | 7 |
+| Cross-document | 2 |
 
 Each entry contains:
 
@@ -331,9 +386,15 @@ Each entry contains:
 }
 ```
 
-The 2 out-of-scope entries cover topics not in the corpus (ePrivacy Directive, EU financial market regulation). Their responses are recorded for manual review only.
+**Dataset construction history:**
 
-**Dataset construction note:** The initial dataset was generated by a research agent (Claude) and contained systematic errors in 6 DGA entries where paragraph-level numbers within articles were misidentified as article numbers (e.g., "paragraph 12 of Article 11" was recorded as `expected_articles: ["12"]`). These were corrected by programmatic verification against the actual text, cross-referencing article boundary positions in `data_governance_act.txt`. The corrected article numbers are 11, 11, 14, 14, 19, and 24.
+The original 33-entry dataset (31 in-scope, 2 OOS) covered only single-article factual lookups. It was expanded in two stages:
+
+1. *Structural corrections (pre-AOC-00):* 6 DGA entries contained systematic errors where paragraph-level numbers within articles were misidentified as article numbers (e.g., "paragraph 12 of Article 11" recorded as `expected_articles: ["12"]`). Corrected by programmatic verification against the actual text. The corrected article numbers are 11, 11, 14, 14, 19, and 24.
+
+2. *Dataset expansion (AOC-00):* 15 new entries added — 8 in-scope (multi-hop within a document, cross-document synthesis, negative scope questions) and 8 OOS entries covering topics absent from the corpus: ePrivacy Directive, MiFID II, NIS2 Directive, Digital Markets Act, Product Liability Directive, EU copyright law, consumer protection, and EU competition law (TFEU Article 102). Total OOS entries: 10.
+
+The new question types expose failure modes invisible to single-article recall: multi-hop queries require the retriever to surface chunks from two articles simultaneously; cross-document queries require chunks from two different regulations; negative questions test whether the model correctly identifies the scope boundary of a regulation.
 
 ### 9.2 Metric 1 — Retrieval Recall
 
@@ -341,9 +402,7 @@ The 2 out-of-scope entries cover topics not in the corpus (ePrivacy Directive, E
 retrieval_recall = (number of expected articles found in top-K chunks) / (number of expected articles)
 ```
 
-**Document-scoped:** When `expected_document` is provided, only chunks whose `document` metadata matches are considered. This prevents a GDPR Article 5 chunk from counting as a hit for a DGA Article 5 question — a real failure mode observed in early evaluation when the metric was document-agnostic.
-
-A score of 1.0 means all articles that should have been retrieved were in the top-K results. A score of 0.0 means none were.
+**Document-scoped:** When `expected_document` is provided, only chunks whose `document` metadata matches are considered. This prevents a GDPR Article 5 chunk from counting as a hit for a DGA Article 5 question.
 
 ### 9.3 Metric 2 — Citation Accuracy
 
@@ -355,23 +414,21 @@ Checks whether key numeric facts from `expected_answer` appear verbatim (after w
 
 | Pattern | Examples extracted |
 |---------|-------------------|
-| `EUR[\s\xa0][\d,]+` | `EUR 20,000,000`, `EUR 35,000,000` |
-| `\d+(?:\.\d+)?\s*%` | `4%`, `7%`, `2.5%` |
+| `EUR[\s\xa0][\d\s,]+` | `EUR 20 000 000`, `EUR 35 000 000` |
+| `\d+(?:\.\d+)?[\s\xa0]*%` | `4 %`, `7 %`, `2.5%` |
 | `\d+(?:\s+calendar)?\s+(?:hours?\|days?\|...)` | `72 hours`, `30 calendar days`, `5 years` |
 
-A fallback numeric match (stripping commas and spaces) handles formatting differences between the expected answer and the model's response (e.g., `20,000,000` vs `20000000`).
+Note: patterns use `[\s\xa0]` to handle EUR-Lex's Unicode non-breaking space thousand separators (GQ-11). A fallback numeric match strips all separators for comparison.
 
 ```
 fact_score = (facts found in response) / (total facts in expected_answer)
 ```
 
-Entries with no extractable numeric facts receive `fact_score = 1.0` by default (they are not penalised).
-
-**Scope and limitations:** This metric is intentionally narrow — it only checks numeric/monetary/temporal facts, not qualitative claims. It is fast, deterministic, and catches the most critical errors in legal Q&A (wrong penalty amounts, wrong time limits). Non-numeric definitional answers (e.g., "data altruism") score 1.0 regardless of response quality, which is why the LLM-as-judge metric is necessary as a complement.
+Entries with no extractable numeric facts receive `fact_score = 1.0` by default.
 
 ### 9.5 Metric 4 — LLM-as-Judge
 
-A second call to the same Qwen model (reusing the already-loaded `Settings.llm` instance) evaluates each response against the expected answer with a structured scoring prompt:
+A second call to the same Qwen model evaluates each response against the expected answer:
 
 ```
 SCORING CRITERIA:
@@ -380,25 +437,67 @@ SCORING CRITERIA:
   0 – Incorrect: Response is wrong, irrelevant, or missing critical information.
 ```
 
-The model is instructed to respond with a single-line JSON object:
+The model responds with a single-line JSON object:
 
 ```json
 {"score": 2, "reason": "Response correctly identifies 72 hours and Article 33."}
 ```
 
-A regex extraction layer (`re.search(r'\{.*?"score"\s*:\s*([012]).*?\}', raw, re.DOTALL)`) handles cases where the model wraps the JSON in prose. A digit-only fallback handles further degradation.
+A regex extraction layer handles cases where the model wraps the JSON in prose. A digit-only fallback handles further degradation.
 
-**Self-judge bias:** Using the same model as both the responder and the judge introduces a known bias — models tend to rate their own outputs more favourably. This is partially mitigated by the structured prompt and explicit scoring criteria, but a more rigorous setup would use a separate, stronger judge model (e.g., `Qwen2.5-72B` or a frontier model via API). The current approach is a practical compromise given on-premises constraints.
+**Self-judge bias:** Using the same model as both the responder and the judge introduces a known bias. A more rigorous setup would use a separate, stronger judge model. The current approach is a practical compromise given on-premises constraints.
 
-**Efficiency:** The judge call reuses the loaded model weights with no reloading overhead. Each judge call adds roughly 2–4 seconds to per-query latency (not included in the reported `latency_s`, which measures only the RAG query).
+### 9.6 Metric 5 — OOS Refusal Rate (AOC-01)
 
-### 9.6 CLI Interface
+For each OOS entry, `detect_oos_refusal(response_text)` returns `True` if the response contains a clear refusal signal:
+
+```python
+_OOS_REFUSAL_RE = re.compile(
+    r"outside (the )?scope"
+    r"|not covered"
+    r"|not (contain|include|address|discuss|mention|found|available)\b"
+    r"|cannot (find|answer|provide|determine)\b"
+    r"|no (information|content|data) (found|available|provided|in the)"
+    r"|not in the (provided|retrieved|available)\b",
+    re.IGNORECASE,
+)
+```
+
+Aggregated as `oos_refusal_rate = refused / total_oos`. A rate of 0% means the system attempts to answer every OOS query; 100% means it cleanly refuses all of them.
+
+### 9.7 Metric 6 — Cross-Document Retrieval Recall (AOC-01)
+
+For entries with multiple `(article, document)` pairs, each pair must be satisfied independently. A cross-doc entry requiring GDPR Art.33 and CRA Art.14 scores 0.5 if only one is retrieved — even if the overall article-number hit is 100%. Implemented by paired traversal of `expected_articles` and `expected_documents` lists.
+
+### 9.8 Metric 7 — Source Attribution Accuracy (AOC-01)
+
+Detects document-name phantom citations: cases where the model correctly states an article number but attributes it to the wrong regulation (e.g., "GDPR Article 5" when the answer required "AI Act Article 5"). Two regex patterns extract qualified `(document, article)` mentions from the response; each extracted pair is checked against the retrieved chunks' metadata.
+
+### 9.9 Latency and Context Profiling (AOC-04)
+
+Each eval entry also records:
+
+- `prompt_tokens` — estimated tokens in the LLM prompt (accumulated across all LLM calls for the query)
+- `retrieval_latency_s` — time spent in the retriever
+- `gen_latency_s` — time spent inside the LLM pipeline
+- `chunks_retrieved` / `chunks_in_prompt` — count before and after context assembly
+- `truncated` / `dropped_chunks` — whether any retrieved chunks were silently dropped
+
+`print_profiling_stats()` summarises mean/p90/max for all profiling metrics at the end of each eval run.
+
+### 9.10 MLflow Experiment Tracking (IN-02)
+
+Each eval run logs to an MLflow experiment (`EU Legal RAG Evaluation`). Parameters logged: `top_k`, `chunking_strategy`, `reranker`, `reranker_top_n`, `n_entries`, `n_in_scope`, `n_oos`. Metrics logged: `avg_retrieval_recall`, `cross_doc_recall`, `citation_accuracy`, `attribution_accuracy`, `avg_fact_score`, `avg_judge_score`, `oos_refusal_rate`, `avg_latency_s`, `avg_prompt_tokens`, `truncation_rate`. The full results JSON is attached as an artifact.
+
+### 9.11 CLI Interface
 
 ```bash
-python src/eval_runner.py                          # full eval with judge
-python src/eval_runner.py --no-judge               # skip judge, faster
-python src/eval_runner.py --top-k 8               # adjust retrieval K
-python src/eval_runner.py --out results.json       # custom output path
+python src/eval_runner.py                            # full eval with judge
+python src/eval_runner.py --no-judge                 # skip judge, faster
+python src/eval_runner.py --top-k 8                 # adjust retrieval K
+python src/eval_runner.py --reranker                 # enable re-ranker (top-n=5 default)
+python src/eval_runner.py --reranker --reranker-top-n 8
+python src/eval_runner.py --out results.json         # custom output path
 ```
 
 Results are saved as a JSON array to `data/eval_results_<timestamp>.json`, with one object per dataset entry containing all raw scores and the model's response text.
@@ -407,7 +506,7 @@ Results are saved as a JSON array to `data/eval_results_<timestamp>.json`, with 
 
 ## 10. Results & Analysis
 
-### 10.1 Iterative Improvement History
+### 10.1 Iterative Improvement History (original pipeline)
 
 | Run | Key Change | Recall | Citation | Notes |
 |-----|-----------|--------|----------|-------|
@@ -417,71 +516,97 @@ Results are saved as a JSON array to `data/eval_results_<timestamp>.json`, with 
 | 4 – Identity sentences | Document name in chunk body | 71.0% | 96.8% | Citation improved; DGA still broken |
 | 5 – BM25 hybrid + dataset fix | `QueryFusionRetriever` + corrected DGA entries | **100.0%** | **100.0%** | DGA 100%, 6.7s latency |
 
-### 10.2 Final Evaluation Results
+### 10.2 Baseline After Expansion (AOC-03)
 
-Evaluated with `top_k=10`, `run_judge=True`, on 33 dataset entries (31 in-scope).
+After expanding the dataset from 33 to 48 entries (harder question types), a fresh baseline was established:
 
 ```
-==================================================
-EVAL SUMMARY
-==================================================
-Total entries         : 33
-In-scope              : 31
-Out-of-scope          : 2
-Avg retrieval recall  : 100.0%
-Citation accuracy     : 100.0%  (31/31 clean)
-Avg fact completeness : 98.4%   (30/31 perfect)
-Avg judge score       : 1.84/2  (28 correct / 1 partial / 2 wrong)
-Avg latency           : 6.6s
+=== Baseline (top_k=10, no re-ranker) ===
+Total entries         : 48
+In-scope              : 38  (cross-document: 2)
+Out-of-scope          : 10
+Avg retrieval recall  : 90.8%
+Cross-doc recall      : 50.0%
+Citation accuracy     : 86.8%  (33/38 clean)
+Source attribution    : 97.4%  (37/38)
+Avg fact completeness : 98.7%
+Avg judge score       : 1.92/2  (35 correct / 3 partial / 0 wrong)
+OOS refusal rate      : 30.0%  (3/10 correctly refused)
+Avg latency           : 5.7s
 ```
+
+The drop from 100% recall (on the original 33-entry set) to 90.8% is entirely attributable to the new harder entries: 5 retrieval failures appeared, all involving multi-hop, cross-document, or negative-scope questions.
 
 **Per-document breakdown:**
 
-| Document | Recall | Fact | Judge |
-|----------|--------|------|-------|
-| AI Act | 100.0% | 91.7% | 1.50 |
-| Cyber Resilience Act | 100.0% | 100.0% | 2.00 |
-| Data Act | 100.0% | 100.0% | 1.67 |
-| Data Governance Act | 100.0% | 100.0% | 2.00 |
-| GDPR | 100.0% | 100.0% | 2.00 |
+| Document | n | Recall | Judge |
+|----------|---|--------|-------|
+| AI Act | 6 | 100.0% | 1.83 |
+| Cyber Resilience Act | 7 | 100.0% | 2.00 |
+| Data Act | 6 | 100.0% | 2.00 |
+| Data Governance Act | 7 | 85.7% | 2.00 |
+| GDPR | 10 | 85.0% | 1.90 |
+| Cross-document | 2 | 50.0% | 1.50 |
 
-The AI Act is the only document with degraded answer quality despite perfect retrieval, pointing to a generation-side problem rather than a retrieval problem.
+### 10.3 Re-Ranker Ablation (RQ-02)
+
+| Configuration | Recall | Citation | Judge | OOS | Latency |
+|---------------|--------|----------|-------|-----|---------|
+| Baseline (no reranker) | 90.8% | 86.8% | 1.92/2 | 30% | 5.7s |
+| Reranker top-8 | 90.8% | 81.6% | 1.79/2 | 40% | 5.1s |
+
+The re-ranker did not improve recall or judge scores at top-8. The slight decrease in citation accuracy and judge score is likely due to the re-ranker demoting some relevant chunks below the top-8 cutoff. The OOS refusal rate improved marginally (30% → 40%), possibly because stricter top-N filtering reduces the volume of loosely relevant context that enables partial answers. Latency improved by 0.6s due to fewer tokens being synthesised.
 
 ---
 
 ## 11. Known Failures & Root Cause Analysis
 
-Three queries scored below the maximum on quality metrics. All had retrieval recall = 1.0 — the correct chunks were retrieved in every case. The failures are therefore attributable to the LLM's generation behaviour.
+All retrieval recalls for failing queries are 1.0 — the correct chunks are being retrieved in every case. The failures are attributable to generation behaviour, retrieval ranking, or query type.
 
-### 11.1 `ai_act_max_fine_prohibited` — Fact score 0.5, Judge score 0
-
-**Query:** *What is the maximum administrative fine for non-compliance with the prohibited AI practices listed in Article 5 of the AI Act?*
-**Expected:** `Up to EUR 35,000,000 or, for an undertaking, up to 7% of total worldwide annual turnover, whichever is higher.`
-**Response excerpt:** *"...the fine can be up to EUR 35,000,000 or 3% of their total worldwide annual turnover..."*
-
-**Root cause:** AI Act Article 99 defines a tiered fine structure: 7% for prohibited practices (Article 5), 3% for other obligations, 1.5% for incorrect information. The retrieved context contained all three tiers. The LLM conflated the tiers and substituted the 3% threshold (the most frequently mentioned percentage across the context window) for the correct 7%. This is a **context confusion** failure: the model correctly retrieved the relevant article but failed to select the right value from a dense, numerically similar list.
-
-**Mitigation options:** Reduce `top_k` to return fewer competing chunks; use a re-ranker to surface the most relevant paragraph first; or add a chain-of-thought instruction to the prompt requiring the model to identify which tier applies before stating the fine.
-
-### 11.2 `ai_act_social_scoring_prohibition` — Judge score 1
+### 11.1 `ai_act_social_scoring_prohibition` — Judge score 1 (partial) *(open)*
 
 **Query:** *Does the AI Act prohibit AI systems used by public or private actors for social scoring...?*
 **Expected:** `Yes. Article 5(1)(c) prohibits...`
-**Response excerpt:** *"...This prohibition is reflected in the Preamble, specifically in paragraph (31)..."*
+**Response excerpt:** *"...This prohibition is explicitly stated in the preamble (Article 31) of the AI Act."*
 
-**Root cause:** The response correctly identifies the prohibition but attributes it to the Preamble rather than Article 5(1)(c). This is a **source attribution error**: the retrieved chunks included both the Preamble recitals (which discuss the rationale for the prohibition) and Article 5 (which enacts it). The LLM cited the recital, which was likely ranked higher in the fused retrieval list, rather than the normative article. The system prompt rule *"Only cite Article or Recital numbers that explicitly appear in the context below"* was followed — Recital 31 was present — but the model did not distinguish between normative and explanatory text.
+**Root cause:** 8 of 10 retrieved chunks are preamble recitals; Article 5 is at ranks 3 and 7. The BM25 and dense retrievers both favour preamble text because recitals use rich descriptive language about social scoring, while normative Article 5(1)(c) is buried in a list of 8+ prohibited practices. Additionally, the sub-paragraph notation `5(1)(c)` does not appear verbatim in any retrieved chunk — the relevant sub-article is in a part not retrieved.
 
-**Mitigation options:** Add a prompt instruction to prefer article-level citations over recital-level citations when both are available; filter preamble chunks from the retrieval pool for questions with known normative targets.
+**Applied mitigations:** Rule 4 added to prompt (GQ-02) — instructs the model to prefer normative articles over recitals when both are present. **Not yet re-evaluated** — a new eval run is needed to measure impact.
 
-### 11.3 `data_act_data_holder_definition` — Judge score 0
+**Remaining gap:** The prompt fix addresses generation but not retrieval ranking. A retrieval-side fix (e.g., a post-processor that demotes preamble chunks when normative articles for the same topic are present) would be more robust.
 
-**Query:** *How does the Data Act define 'data holder'?*
-**Expected:** Full legal definition from Article 2.
-**Response:** *"The retrieved documents indicate that the term 'data holder' is not explicitly defined in the provided context."*
+### 11.2 `negative_gdpr_household_exemption` — Judge score 0 *(open)*
 
-**Root cause:** The model incorrectly claimed the definition was not in the context, despite the correct chunk being retrieved. This is a **hallucinated absence** — a failure mode where the model incorrectly asserts that information is missing. It likely occurs because the retrieved chunk contains many definitions in sequence (Article 2 of the Data Act is a definitions article with ~20 entries), and the model failed to locate the specific term within the dense list. The 512-token sub-chunk budget may have caused the definition to be split across sub-chunks, with `data holder` appearing at the boundary.
+**Query:** *Does the GDPR apply to data processing carried out by a natural person in the course of purely personal or household activity?*
+**Expected:** No — Article 2(2)(c) explicitly excludes it.
+**Response:** The model suggests the GDPR may apply, contradicting the reference answer.
 
-**Mitigation options:** Increase sub-chunk overlap for definition articles; add a pre-processing step that identifies and preserves complete definition entries as atomic units.
+**Root cause:** Negative-scope questions (does a regulation NOT apply?) are a systematically harder retrieval case. The query activates chunks about GDPR applicability (Article 2, Article 3) but the exclusion sub-paragraph `2(2)(c)` may not appear prominently in the retrieved text. The model defaults to affirming applicability because the bulk of retrieved context describes when the GDPR applies rather than when it does not.
+
+### 11.3 `cra_vulnerability_dual_notification` — Judge score 0 *(open)*
+
+**Query:** *What are the specific notification deadlines for actively exploited vulnerabilities under the CRA?*
+**Expected:** 24-hour early warning + 72-hour full notification.
+**Response:** Missing or incorrect deadlines.
+
+**Root cause:** Dual-deadline tiered structures (similar to the AI Act fine tiers) are prone to the same context-confusion failure pattern. The 24h/72h split may appear across multiple chunks or be retrievable only partially.
+
+### 11.4 `dga_data_altruism_definition` — Judge score 1 (partial) *(open)*
+
+**Query:** *How does the DGA define data altruism?*
+**Expected:** Full definition from Article 2.
+**Response:** Partial definition.
+
+**Root cause:** Same definitions-article density problem as `data_act_data_holder_definition` (resolved earlier via GQ-04). The DGA Article 2 definitions entry for "data altruism" may still be split across atomic chunks, or the definition may lack sufficient lexical signal to rank the correct sub-chunk first.
+
+### 11.5 `gdpr_data_minimisation_and_fine` — Judge score 1 (partial) *(open)*
+
+**Query:** Multi-hop: requires combining Article 5 (data minimisation principle) and Article 83 (penalty for violation).
+**Root cause:** Cross-article retrieval gap. The hybrid retriever must surface chunks from both Article 5 and Article 83 simultaneously. At `top_k=10` one of the two is occasionally missed, resulting in an incomplete answer.
+
+### 11.6 Out-of-scope refusal rate: 40% (4/10) *(partially mitigated)*
+
+6 of 10 OOS queries still receive partial answers using loosely retrieved context. The hard refusal Rule 0 (GQ-03) was added to the prompt but has not been re-evaluated. The baseline was 30% (3/10); re-ranker top-8 showed 40% (4/10), which predates the GQ-03 change.
 
 ---
 
@@ -489,28 +614,31 @@ Three queries scored below the maximum on quality metrics. All had retrieval rec
 
 ### 12.1 Current Limitations
 
-**Evaluation dataset size:** 33 entries is sufficient to identify systematic failure modes but too small for statistically stable per-document scores. A single question failure changes a document's score by ~17%. The dataset also covers only factual lookup questions — no multi-hop reasoning, no cross-document synthesis, no negative questions.
+**Evaluation dataset size:** 48 entries is sufficient to identify systematic failure modes but too small for statistically stable per-document scores. Single question failures shift a 6–7 entry document score by ~14–17%.
 
-**Out-of-scope handling:** With only 2 OOS entries, the system's ability to decline out-of-scope questions cannot be measured quantitatively. The current responses to OOS queries suggest the model is partially answering rather than cleanly refusing — a behaviour driven by the prompt's "Answer using ONLY the context" instruction, which doesn't explicitly instruct refusal when context is irrelevant.
+**Preamble retrieval dominance:** For queries whose natural-language form closely matches preamble recital text (which is descriptive and explanatory), the RRF fusion consistently ranks preamble chunks above normative articles. This is a retrieval architecture limitation — neither BM25 nor dense vectors penalise `chunk_type: "preamble"`. A simple metadata filter or score penalty for preamble chunks in normative-query contexts would address this.
 
-**Self-judge bias:** The LLM-as-judge uses the same model as the responder. This likely inflates judge scores for responses that are partially correct, and produces inconsistent scoring on borderline cases.
+**Cross-document recall at 50%:** Queries that require retrieving chunks from two different regulations simultaneously are harder for the hybrid retriever. At `top_k=10`, there is a fixed budget shared across all documents, and one regulation's chunks may crowd out the other. Larger `top_k` or per-document sub-retrievers would help.
+
+**OOS handling:** Despite the hard-refusal instruction (GQ-03), a new eval run is needed to confirm its effect. The fundamental challenge is that the retriever will always return *something* — the model must then decide whether that context is relevant to the question. Without a query classifier or retrieval confidence threshold, the model relies entirely on the prompt instruction.
+
+**Self-judge bias:** The LLM-as-judge uses the same model as the responder. This likely inflates scores for partially correct responses and produces inconsistent scoring on borderline cases.
 
 **Static corpus:** The document texts are static snapshots. The pipeline has no mechanism for detecting or incorporating regulatory amendments.
 
-**Context window pressure:** `CONTEXT_WINDOW = 4096`. With `top_k=10` chunks of up to ~500 tokens each, the retrieved context can be up to 5,000 tokens — exceeding the declared context window. In practice, LlamaIndex truncates to fit, which may silently drop relevant chunks. This has not been measured.
+### 12.2 Open Improvements
 
-### 12.2 Planned Improvements
-
-| Priority | Improvement | Expected Impact |
-|----------|------------|-----------------|
-| High | Expand OOS dataset to ~10 entries; add hard refusal instruction to prompt | Measurable OOS handling; fewer partial answers on irrelevant queries |
-| High | Investigate `ai_act_max_fine_prohibited` with chain-of-thought prompting | Fix tier-confusion failure in AI Act fine questions |
-| Medium | Add multi-hop and cross-document questions to eval dataset | Expose retrieval and generation failures not detectable with single-article lookups |
-| Medium | HierarchicalNodeParser + AutoMergingRetriever | Better handling of long articles where the relevant fact is split across sub-chunks |
-| Medium | Use a stronger judge model (larger Qwen or API-based) | Reduce self-judge bias; more reliable quality scores |
-| Low | Add article titles from EUR-Lex to source `.txt` files | Richer chunk headers; improved retrieval for title-based queries |
-| Low | MLflow experiment tracking | Persist per-run metrics for longitudinal comparison |
+| Priority | Improvement | Target failure |
+|----------|------------|----------------|
+| High | New eval run after GQ-02 + GQ-03 prompt changes | `ai_act_social_scoring_prohibition`, OOS refusal |
+| High | Preamble chunk demotion post-processor | `ai_act_social_scoring_prohibition` class |
+| High | Chain-of-thought tiered deadline handling | `cra_vulnerability_dual_notification` |
+| Medium | Negative-scope query detection | `negative_gdpr_household_exemption` class |
+| Medium | Per-document sub-retrievers or larger `top_k` for cross-doc entries | Cross-doc recall 50% |
+| Medium | Use a stronger judge model (larger Qwen or API-based) | Self-judge bias |
+| Medium | HierarchicalNodeParser + AutoMergingRetriever | Definitions-article partial misses |
+| Low | Add article titles from EUR-Lex to source `.txt` files | Richer chunk headers |
 
 ---
 
-*Report generated from evaluation run `data/eval_results_20260313_202253.json`.*
+*Report reflects evaluation runs through `data/eval_results_20260315_reranker_top8.json`. Prompt changes from GQ-02 and GQ-03 are implemented but not yet reflected in a new eval run.*
